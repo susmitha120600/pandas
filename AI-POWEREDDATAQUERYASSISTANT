@@ -1,0 +1,158 @@
+from flask import Flask, request, render_template_string, jsonify
+import pandas as pd
+import os
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chat_models import ChatOpenAI
+from dotenv import load_dotenv
+from langchain.chains import RetrievalQA
+
+app = Flask(__name__)
+
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+
+# Store QA model globally
+qa_model = None
+vectorstore = None
+
+
+HTML_PAGE = """
+<!doctype html>
+<html>
+  <head>
+    <title>AI-Powered Data Query Assistant</title>
+    <style>
+      body { font-family: Arial; margin: 40px; max-width: 900px; }
+      #chat { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: auto; }
+      .msg { margin: 5px; }
+      .user { text-align: right; color: blue; }
+      .bot { text-align: left; color: green; }
+    </style>
+  </head>
+  <body>
+    <h1>AI-Powered Data Query Assistant</h1>
+    <form id="uploadForm" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".csv, .xlsx, .xls" required>
+      <button type="submit">Upload & Index</button>
+    </form>
+    <p id="status"></p>
+
+    <div id="chat"></div>
+    <input type="text" id="query" placeholder="Ask a question..." style="width:70%">
+    <button id="askBtn">Ask</button>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const chat = document.getElementById('chat');
+
+      document.getElementById('uploadForm').onsubmit = async (e) => {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        statusEl.innerText = 'Uploading and indexing...';
+        const res = await fetch('/upload', {method:'POST', body:formData});
+        const data = await res.json();
+        if (res.ok) statusEl.innerText = `Indexed ${data.rows} rows`;
+        else statusEl.innerText = `Error: ${data.error}`;
+      };
+
+      document.getElementById('askBtn').onclick = async () => {
+        const q = document.getElementById('query').value.trim();
+        if (!q) return;
+        addMsg(q, 'user');
+        document.getElementById('query').value = '';
+        addMsg('Thinking...', 'bot', true);
+        const res = await fetch('/query', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({query:q})
+        });
+        const data = await res.json();
+        removeThinking();
+        if (res.ok) addMsg(data.answer, 'bot');
+        else addMsg('Error: ' + data.error, 'bot');
+      };
+
+      function addMsg(text, cls, thinking=false) {
+        const div = document.createElement('div');
+        div.className = 'msg ' + cls;
+        if (thinking) div.id = 'thinking';
+        div.textContent = text;
+        chat.appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+      }
+
+      function removeThinking() {
+        const t = document.getElementById('thinking');
+        if (t) t.remove();
+      }
+    </script>
+  </body>
+</html>
+"""
+
+
+def build_vectorstore_from_df(df):
+    from langchain.docstore.document import Document
+    docs = []
+    for i, row in df.iterrows():
+        text = "\n".join([f"{col}: {row[col]}" for col in df.columns])
+        docs.append(Document(page_content=text, metadata={"row": i}))
+
+    embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+    os.makedirs("chroma_store", exist_ok=True)
+    vectordb = Chroma.from_documents(docs, embeddings, persist_directory="chroma_store")
+    vectordb.persist()
+    return vectordb
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string(HTML_PAGE)
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    global vectorstore, qa_model
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    fname = file.filename.lower()
+    try:
+        if fname.endswith(".csv"):
+            df = pd.read_csv(file)
+        elif fname.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(file)
+        else:
+            return jsonify({"error": "Only CSV or Excel allowed"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    vectorstore = build_vectorstore_from_df(df)
+    retriever = vectorstore.as_retriever()
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    qa_model = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
+    return jsonify({"rows": len(df)})
+
+
+@app.route("/query", methods=["POST"])
+def query():
+    global qa_model
+    if qa_model is None:
+        return jsonify({"error": "Please upload and index data first."}), 400
+
+    data = request.get_json()
+    query_text = data.get("query", "")
+    if not query_text:
+        return jsonify({"error": "Query text missing"}), 400
+
+    try:
+        answer = qa_model.run(query_text)
+        return jsonify({"answer": answer})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
